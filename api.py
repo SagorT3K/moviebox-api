@@ -470,43 +470,145 @@ async def get_home_categories():
             categories["movie"].append(section_data)
     return {"status": "success", "categories": categories}
 
+async def _map_subjects(raw_items) -> list:
+    return [{
+        "name": sub.get("title"),
+        "poster_url": (sub.get("cover") or {}).get("url"),
+        "slug": sub.get("detailPath"),
+        "subject_id": sub.get("subjectId"),
+        "badge": sub.get("corner"),
+        "rating": sub.get("imdbRatingValue"),
+        "year": sub.get("releaseDate", "")[:4] if sub.get("releaseDate") else None,
+        "genre": sub.get("genre"),
+        "subject_type": sub.get("subjectType"),
+    } for sub in raw_items]
+
+async def _get_trending_data(tab_id: int, page: int = 1, per_page: int = 24) -> dict:
+    """Clean per-type catalog feed. `subject/filter` ignores tabId now and
+    returns music/nursery junk; `subject/trending` still respects it
+    (2=movies, 5=tv, 8=animation)."""
+    url = f"{API_BASE}/subject/trending?tabId={tab_id}&page={page}&perPage={per_page}"
+    data = await _make_request(url)
+    inner = data.get("data", {})
+    items = await _map_subjects(inner.get("subjectList", inner.get("items", [])))
+    pager = inner.get("pager", {})
+    has_more = pager.get("hasMore", len(items) >= per_page)
+    return {"page": page, "per_page": per_page, "has_more": has_more, "items": items}
+
 async def _get_category_data(tab_id: int, page: int = 1, per_page: int = 24, sort: str = "RECOMMEND") -> dict:
     url = f"{API_BASE}/subject/filter"
     payload = {"tabId": tab_id, "filter": {"sort": sort, "genre": "ALL", "country": "ALL", "year": "ALL", "language": "ALL"}, "page": page, "perPage": per_page}
     data = await _make_request(url, method="POST", payload=payload)
     inner = data.get("data", {})
     raw_items = inner.get("items", inner.get("subjects", []))
-    items = [{
-        "name": sub.get("title"),
-        "poster_url": sub.get("cover", {}).get("url"),
-        "slug": sub.get("detailPath"),
-        "subject_id": sub.get("subjectId"),
-        "badge": sub.get("corner"),
-        "rating": sub.get("imdbRatingValue"),
-        "year": sub.get("releaseDate", "")[:4] if sub.get("releaseDate") else None
-    } for sub in raw_items]
+    items = await _map_subjects(raw_items)
     pager = inner.get("pager", {})
     total = pager.get("totalCount") or inner.get("total") or len(items)
     return {"page": page, "per_page": per_page, "total": total, "items": items}
 
 @app.get("/movies")
 async def get_movies(page: int = 1, sort: str = "RECOMMEND"):
-    return await _get_category_data(tab_id=2, page=page, sort=sort)
+    return await _get_trending_data(tab_id=2, page=page)
 
 @app.get("/tv-series")
 async def get_tv_series(page: int = 1, sort: str = "RECOMMEND"):
-    return await _get_category_data(tab_id=5, page=page, sort=sort)
+    return await _get_trending_data(tab_id=5, page=page)
 
 @app.get("/animation")
 async def get_animation(page: int = 1, sort: str = "RECOMMEND"):
-    return await _get_category_data(tab_id=8, page=page, sort=sort)
+    return await _get_trending_data(tab_id=8, page=page)
+
+@app.get("/dubbed")
+async def get_dubbed(language: str = "Hindi", page: int = 1, per_page: int = 24):
+    """Content with an audio dub in the given language. Upstream's filter only
+    honors language=Hindi; other values fall through to the generic feed.
+    Music/showtunes (subjectType 3/6) are filtered out."""
+    url = f"{API_BASE}/subject/filter"
+    payload = {"tabId": 0, "filter": {"sort": "MOST_WATCHED", "genre": "ALL", "country": "ALL", "year": "ALL", "language": language}, "page": page, "perPage": per_page * 2}
+    data = await _make_request(url, method="POST", payload=payload)
+    inner = data.get("data", {})
+    raw = inner.get("items", inner.get("subjects", []))
+    items = [it for it in (await _map_subjects(raw)) if it.get("subject_type") in (1, 2)]
+    # Fetch extra since many items are dropped (music) — top up from the next page when short
+    if len(items) < per_page:
+        extra = await _make_request(url, method="POST", payload={**payload, "page": page + 1})
+        raw2 = extra.get("data", {}).get("items", [])
+        items += [it for it in (await _map_subjects(raw2)) if it.get("subject_type") in (1, 2)]
+    # Deduplicate by subject_id
+    seen, unique = set(), []
+    for it in items:
+        sid = it.get("subject_id")
+        if sid and sid not in seen:
+            seen.add(sid)
+            unique.append(it)
+    return {"page": page, "language": language, "items": unique[:per_page], "has_more": len(unique) > 0}
+
+# --- Genres/Categories ---
+# Upstream has no working server-side genre filter (tested: /subject/filter
+# ignores every genre key variant), so genre pages are composed locally by
+# pooling the per-type trending feed and matching the item `genre` field.
+GENRES = [
+    "Action", "Adventure", "Animation", "Anime", "Comedy", "Crime",
+    "Documentary", "Drama", "Family", "Fantasy", "History", "Horror",
+    "Kids", "Music", "Mystery", "Reality", "Romance", "Sci-Fi",
+    "Sport", "Talk", "Thriller", "TV Movie", "War", "Western",
+]
+GENRE_TAB = {"movie": 2, "tv": 5, "animation": 8}
+_trending_pool: dict = {}  # tab_id -> {"ts": float, "pages": int, "items": list}
+POOL_TTL = 30 * 60  # seconds
+POOL_MAX_PAGES = 25
+
+async def _pool_page(tab_id: int, page: int) -> list:
+    data = await _get_trending_data(tab_id, page=page, per_page=24)
+    return data.get("items", [])
+
+async def _genres_pool_collect(tab_id: int, genre: str, need: int) -> list:
+    now = asyncio.get_event_loop().time()
+    pool = _trending_pool.get(tab_id)
+    if not pool or now - pool["ts"] > POOL_TTL:
+        pool = {"ts": now, "pages": 0, "items": []}
+        _trending_pool[tab_id] = pool
+
+    def matches(items):
+        g = genre.lower()
+        return [it for it in items if g in [x.strip().lower() for x in (it.get("genre") or "").split(",")]]
+
+    found = matches(pool["items"])
+    while len(found) < need and pool["pages"] < POOL_MAX_PAGES:
+        pool["pages"] += 1
+        new_items = await _pool_page(tab_id, pool["pages"])
+        if not new_items:
+            break
+        pool["items"].extend(new_items)
+        pool["ts"] = now
+        found = matches(pool["items"])
+    return found
+
+@app.get("/genres")
+async def list_genres():
+    return {"genres": GENRES, "types": ["movie", "tv", "animation"]}
+
+@app.get("/genre/{name}")
+async def get_genre(name: str, type: str = "movie", page: int = 1, per_page: int = 24):
+    tab_id = GENRE_TAB.get(type, 2)
+    need = page * per_page
+    matched = await _genres_pool_collect(tab_id, name, need)
+    start = (page - 1) * per_page
+    return {
+        "genre": name,
+        "type": type,
+        "page": page,
+        "total": len(matched),
+        "items": matched[start:start + per_page],
+        "has_more": len(matched) > start + per_page,
+    }
 
 @app.get("/ranking")
 async def get_ranking(page: int = 1, per_page: int = 24):
-    """Most watched content across all categories, sorted by popularity."""
+    """Most watched content across all categories (clean per-type feeds)."""
     all_items = []
     for tab_id in [2, 5, 8]:
-        result = await _get_category_data(tab_id=tab_id, page=1, per_page=40, sort="MOST_WATCHED")
+        result = await _get_trending_data(tab_id=tab_id, page=page, per_page=8)
         all_items.extend(result.get("items", []))
     # Deduplicate by subject_id
     seen = set()
@@ -516,17 +618,17 @@ async def get_ranking(page: int = 1, per_page: int = 24):
         if sid and sid not in seen:
             seen.add(sid)
             unique.append(item)
-    start = (page - 1) * per_page
-    end = start + per_page
-    return {"page": page, "per_page": per_page, "total": len(unique), "items": unique[start:end]}
+    return {"page": page, "per_page": per_page, "total": len(unique), "items": unique[:per_page]}
 
 @app.get("/top-imdb")
 async def get_top_imdb(page: int = 1, per_page: int = 24):
     """Top IMDB rated content across all categories."""
     all_items = []
-    for tab_id in [2, 5, 8]:
-        result = await _get_category_data(tab_id=tab_id, page=1, per_page=40, sort="RECOMMEND")
-        all_items.extend(result.get("items", []))
+    pages_needed = min(1 + (page * per_page) // 24, POOL_MAX_PAGES)
+    for p in range(1, pages_needed + 1):
+        for tab_id in [2, 5, 8]:
+            result = await _get_trending_data(tab_id=tab_id, page=p, per_page=12)
+            all_items.extend(result.get("items", []))
     # Deduplicate by subject_id
     seen = set()
     unique = []
