@@ -1,19 +1,19 @@
-import httpx, json
+import httpx, json, sys
+
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 BASE = "http://localhost:8000"
 
 ENDPOINTS = [
     "/",
     "/home",
-    "/home/trending",
-    "/home/hot",
-    "/home/cinema",
-    "/home/banner",
-    "/home/sections",
-    "/tv-series",
     "/movies",
+    "/tv-series",
     "/animation",
-    "/ranking",
 ]
 
 def check_movies(movies, label):
@@ -29,46 +29,42 @@ for path in ENDPOINTS:
     url = BASE + path
     try:
         r = httpx.get(url, timeout=30)
-        data = r.json()
         status = "OK" if r.status_code == 200 else f"ERR {r.status_code}"
         print(f"\n[{status}] {path}")
 
-        # Root
+        # Root dashboard
         if path == "/":
-            print(f"  endpoints listed: {len(data.get('endpoints', []))}")
+            print(f"  dashboard loaded: HTTP {r.status_code} (HTML dashboard)")
             continue
 
-        # Banner
-        if path == "/home/banner":
-            featured = data.get("featured", [])
-            print(f"  featured: {len(featured)}")
-            if featured:
-                f = featured[0]
-                print(f"  sample: name={f.get('name','?')[:40]!r} | poster={'YES' if f.get('poster_url') else 'NULL'}")
-            continue
+        data = r.json()
 
-        # Sections list
-        if path == "/home/sections":
-            secs = data.get("sections", [])
-            print(f"  sections: {len(secs)}")
-            for s in secs:
-                print(f"    - {s['name']!r} ({s['count']} movies)")
-            continue
-
-        # Single section (trending/hot/cinema)
-        if "movies" in data:
-            print(f"  section: {data.get('section','?')!r}")
-            check_movies(data["movies"], path)
-            continue
-
-        # Multi-section pages (/home, /tv-series, etc.)
+        # Multi-section pages (/home, /movies, /tv-series, /animation)
         sections = data.get("sections", [])
-        print(f"  total_sections: {len(sections)} | poster_map_size: {data.get('poster_map_size', '?')}")
-        for s in sections:
-            print(f"  [{s['section']!r}] {s['count']} movies")
-            check_movies(s.get("movies", []), s["section"])
+        if sections:
+            print(f"  total_sections: {len(sections)}")
+            for s in sections:
+                print(f"  [{s.get('section','?')!r}] {s.get('count',0)} movies")
+                check_movies(s.get("items", []), s.get("section", "?"))
+        else:
+            # Single flat list (e.g. /movies returns items directly)
+            items = data.get("items", [])
+            print(f"  items: {len(items)}")
+            check_movies(items, path)
 
     except Exception as e:
         print(f"\n[FAIL] {path} => {e}")
+
+# Test search
+print("\n--- Search Test ---")
+try:
+    r = httpx.get(f"{BASE}/search?q=attack", timeout=30)
+    data = r.json()
+    items = data.get("items", [])
+    print(f"[OK] /search?q=attack => {len(items)} results")
+    if items:
+        print(f"  sample: name={items[0].get('name','?')[:40]!r}")
+except Exception as e:
+    print(f"[FAIL] /search => {e}")
 
 print("\n\nDone.")

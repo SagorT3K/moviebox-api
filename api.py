@@ -1,3 +1,4 @@
+import os
 import re
 import json
 import httpx
@@ -5,6 +6,8 @@ import asyncio
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+
+PORT = int(os.environ.get("PORT", 8000))
 
 app = FastAPI(
     title="MovieBox API Pro",
@@ -23,6 +26,7 @@ BASE_URL = "https://moviebox.ph"
 API_BASE = "https://h5-api.aoneroom.com/wefeed-h5api-bff"
 
 _bearer_token: str | None = None
+_token_lock = asyncio.Lock()
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
@@ -62,19 +66,22 @@ async def _get_bearer_token() -> str:
     global _bearer_token
     if _bearer_token:
         return _bearer_token
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
-        resp = await client.get(f"{API_BASE}/home?host=moviebox.ph", headers=DEFAULT_HEADERS)
-        x_user = resp.headers.get("x-user")
-        if x_user:
-            _bearer_token = json.loads(x_user).get("token")
-        if not _bearer_token:
-            # fallback: read from set-cookie
-            cookie = resp.headers.get("set-cookie", "")
-            import re as _re
-            m = _re.search(r"token=([^;]+)", cookie)
-            if m:
-                _bearer_token = m.group(1)
-    return _bearer_token or ""
+    async with _token_lock:
+        # Double-check after acquiring lock
+        if _bearer_token:
+            return _bearer_token
+        async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
+            resp = await client.get(f"{API_BASE}/home?host=moviebox.ph", headers=DEFAULT_HEADERS)
+            x_user = resp.headers.get("x-user")
+            if x_user:
+                _bearer_token = json.loads(x_user).get("token")
+            if not _bearer_token:
+                # fallback: read from set-cookie
+                cookie = resp.headers.get("set-cookie", "")
+                m = re.search(r"token=([^;]+)", cookie)
+                if m:
+                    _bearer_token = m.group(1)
+        return _bearer_token or ""
 
 async def _make_request(url: str, method: str = "GET", payload: dict = None, custom_headers: dict = None) -> dict:
     global _bearer_token
@@ -91,12 +98,13 @@ async def _make_request(url: str, method: str = "GET", payload: dict = None, cus
             else:
                 resp = await client.get(url, headers=headers)
 
-            # Refresh token if server sends a new one
+            # Refresh token if server sends a new one (under lock)
             x_user = resp.headers.get("x-user")
             if x_user:
                 new_token = json.loads(x_user).get("token")
                 if new_token:
-                    _bearer_token = new_token
+                    async with _token_lock:
+                        _bearer_token = new_token
 
             if resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"Upstream API error: {resp.status_code}")
@@ -382,13 +390,22 @@ async def get_home():
         op_type = op.get("type")
         title = op.get("title", "Featured")
         if op_type == "BANNER":
-            items = [{
-                "name": item.get("title") or (item.get("subject") or {}).get("title"),
-                "poster_url": item.get("image", {}).get("url") or (item.get("subject") or {}).get("cover", {}).get("url"),
-                "slug": item.get("detailPath") or (item.get("subject") or {}).get("detailPath"),
-                "subject_id": (item.get("subject") or {}).get("subjectId"),
-                "badge": (item.get("subject") or {}).get("corner")
-            } for item in op.get("banner", {}).get("items", []) if item.get("title") and "Communities" not in item.get("title")]
+            raw_banner = op.get("banner", {}).get("items", [])
+            items = []
+            for item in raw_banner:
+                subj = item.get("subject") or {}
+                title = item.get("title") or subj.get("title") or ""
+                # Skip only the generic "Communities" promo tiles
+                if "Communities" in title:
+                    continue
+                items.append({
+                    "name": title,
+                    "poster_url": item.get("image", {}).get("url") or subj.get("cover", {}).get("url"),
+                    "slug": item.get("detailPath") or subj.get("detailPath"),
+                    "subject_id": item.get("subjectId") or subj.get("subjectId"),
+                    "badge": subj.get("corner"),
+                    "image_url": item.get("image", {}).get("url") or subj.get("cover", {}).get("url"),
+                })
             sections.append({"section": "Banner", "count": len(items), "items": items})
         elif op_type in ["SUBJECTS_MOVIE", "SUBJECTS_TV", "SUBJECTS_ANIMATION"]:
             items = [{
@@ -401,6 +418,40 @@ async def get_home():
             } for sub in op.get("subjects", [])]
             sections.append({"section": title, "count": len(items), "items": items})
     return {"status": "success", "sections": sections}
+
+@app.get("/home/categories")
+async def get_home_categories():
+    """Return home sections grouped by category type (movie, tv, animation) based on title keywords."""
+    url = f"{API_BASE}/home?host=moviebox.ph"
+    data = await _make_request(url)
+    categories = {"movie": [], "tv": [], "animation": []}
+    # Keywords to match section titles to categories
+    tv_keywords = ["series", "drama", "tv", "turkish"]
+    anim_keywords = ["anime", "animation", "cartoon"]
+    for op in data.get("data", {}).get("operatingList", []) or []:
+        op_type = op.get("type")
+        title = op.get("title", "Featured")
+        if op_type == "BANNER":
+            continue
+        items = [{
+            "name": sub.get("title"),
+            "poster_url": sub.get("cover", {}).get("url"),
+            "slug": sub.get("detailPath"),
+            "subject_id": sub.get("subjectId"),
+            "badge": sub.get("corner"),
+            "rating": sub.get("imdbRatingValue")
+        } for sub in op.get("subjects", [])]
+        if not items:
+            continue
+        section_data = {"title": title, "items": items}
+        title_lower = title.lower()
+        if any(kw in title_lower for kw in anim_keywords):
+            categories["animation"].append(section_data)
+        elif any(kw in title_lower for kw in tv_keywords):
+            categories["tv"].append(section_data)
+        else:
+            categories["movie"].append(section_data)
+    return {"status": "success", "categories": categories}
 
 async def _get_category_data(tab_id: int, page: int = 1, per_page: int = 24, sort: str = "RECOMMEND") -> dict:
     url = f"{API_BASE}/subject/filter"
@@ -433,6 +484,46 @@ async def get_tv_series(page: int = 1, sort: str = "RECOMMEND"):
 async def get_animation(page: int = 1, sort: str = "RECOMMEND"):
     return await _get_category_data(tab_id=8, page=page, sort=sort)
 
+@app.get("/ranking")
+async def get_ranking(page: int = 1, per_page: int = 24):
+    """Most watched content across all categories, sorted by popularity."""
+    all_items = []
+    for tab_id in [2, 5, 8]:
+        result = await _get_category_data(tab_id=tab_id, page=1, per_page=40, sort="MOST_WATCHED")
+        all_items.extend(result.get("items", []))
+    # Deduplicate by subject_id
+    seen = set()
+    unique = []
+    for item in all_items:
+        sid = item.get("subject_id")
+        if sid and sid not in seen:
+            seen.add(sid)
+            unique.append(item)
+    start = (page - 1) * per_page
+    end = start + per_page
+    return {"page": page, "per_page": per_page, "total": len(unique), "items": unique[start:end]}
+
+@app.get("/top-imdb")
+async def get_top_imdb(page: int = 1, per_page: int = 24):
+    """Top IMDB rated content across all categories."""
+    all_items = []
+    for tab_id in [2, 5, 8]:
+        result = await _get_category_data(tab_id=tab_id, page=1, per_page=40, sort="RECOMMEND")
+        all_items.extend(result.get("items", []))
+    # Deduplicate by subject_id
+    seen = set()
+    unique = []
+    for item in all_items:
+        sid = item.get("subject_id")
+        if sid and sid not in seen:
+            seen.add(sid)
+            unique.append(item)
+    # Sort by IMDB rating descending, items with no rating go to the end
+    unique.sort(key=lambda x: float(x.get("rating") or 0), reverse=True)
+    start = (page - 1) * per_page
+    end = start + per_page
+    return {"page": page, "per_page": per_page, "total": len(unique), "items": unique[start:end]}
+
 @app.get("/search/suggest")
 async def get_search_suggestions(q: str = Query(..., min_length=1)):
     url = f"{API_BASE}/subject/search-suggest"
@@ -441,12 +532,17 @@ async def get_search_suggestions(q: str = Query(..., min_length=1)):
     raw = inner.get("items", inner.get("list", []))
     suggestions = []
     for item in raw:
+        # Suggestions return `word` (text) and optional `subject` (full object)
+        word = item.get("word") or item.get("title") or ""
         sub = item.get("subject") or {}
-        suggestions.append({
-            "title": sub.get("title") or item.get("word") or item.get("title"),
-            "slug": sub.get("detailPath") or item.get("detailPath"),
-            "subject_id": sub.get("subjectId") or item.get("subjectId")
-        })
+        if not word and sub:
+            word = sub.get("title", "")
+        if word:
+            suggestions.append({
+                "word": word,
+                "slug": sub.get("detailPath"),
+                "subject_id": sub.get("subjectId"),
+            })
     return {"suggestions": suggestions}
 
 @app.get("/search")
@@ -457,9 +553,15 @@ async def search(q: str = Query(..., min_length=1), page: int = 1):
     raw = inner.get("items", inner.get("list", []))
     items = [{
         "name": sub.get("title"),
-        "poster_url": sub.get("cover", {}).get("url"),
+        "poster_url": (sub.get("cover") or {}).get("url"),
         "slug": sub.get("detailPath"),
-        "subject_id": sub.get("subjectId")
+        "subject_id": sub.get("subjectId"),
+        "rating": sub.get("imdbRatingValue"),
+        "badge": sub.get("corner"),
+        "year": sub.get("releaseDate", "")[:4] if sub.get("releaseDate") else None,
+        "genre": sub.get("genre"),
+        "country": sub.get("countryName"),
+        "subject_type": sub.get("subjectType"),
     } for sub in raw]
     pager = inner.get("pager", {})
     total = pager.get("totalCount") or inner.get("total") or len(items)
@@ -553,4 +655,4 @@ async def get_captions(subject_id: str, detail_path: str, se: int = 1, ep: int =
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("newapi:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("api:app", host="0.0.0.0", port=PORT, reload=True)
