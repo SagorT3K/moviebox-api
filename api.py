@@ -83,6 +83,23 @@ async def _get_bearer_token() -> str:
                     _bearer_token = m.group(1)
         return _bearer_token or ""
 
+async def _refresh_bearer_token() -> str:
+    """Force-acquire a fresh guest JWT (used when the cached one is rejected)."""
+    global _bearer_token
+    async with _token_lock:
+        _bearer_token = None
+        async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
+            resp = await client.get(f"{API_BASE}/home?host=moviebox.ph", headers=DEFAULT_HEADERS)
+            x_user = resp.headers.get("x-user")
+            if x_user:
+                _bearer_token = json.loads(x_user).get("token")
+            if not _bearer_token:
+                cookie = resp.headers.get("set-cookie", "")
+                m = re.search(r"token=([^;]+)", cookie)
+                if m:
+                    _bearer_token = m.group(1)
+        return _bearer_token or ""
+
 async def _make_request(url: str, method: str = "GET", payload: dict = None, custom_headers: dict = None) -> dict:
     global _bearer_token
     token = await _get_bearer_token()
@@ -585,9 +602,22 @@ async def get_stream_sources(subject_id: str, detail_path: str, se: int = 1, ep:
     )
     play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
 
+    token = await _get_bearer_token()
+    play_headers = {**PLAYER_HEADERS, "Referer": player_referer}
+    if token:
+        play_headers["Authorization"] = f"Bearer {token}"
+
     async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
-        resp = await client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
+        resp = await client.get(play_url, headers=play_headers)
         data = resp.json().get("data", {})
+
+        # Retry once with a fresh token if upstream served an empty payload
+        if not data.get("hasResource") and not data.get("streams"):
+            fresh = await _refresh_bearer_token()
+            if fresh:
+                play_headers["Authorization"] = f"Bearer {fresh}"
+                resp = await client.get(play_url, headers=play_headers)
+                data = resp.json().get("data", {})
 
     has_resource = data.get("hasResource", False)
     streams = [
@@ -625,8 +655,13 @@ async def get_captions(subject_id: str, detail_path: str, se: int = 1, ep: int =
     )
     play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
 
+    token = await _get_bearer_token()
+    play_headers = {**PLAYER_HEADERS, "Referer": player_referer}
+    if token:
+        play_headers["Authorization"] = f"Bearer {token}"
+
     async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
-        play_resp = await client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
+        play_resp = await client.get(play_url, headers=play_headers)
         play_data = play_resp.json().get("data", {})
 
     streams = play_data.get("streams", [])
