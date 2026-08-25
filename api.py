@@ -3,24 +3,45 @@ import re
 import json
 import httpx
 import asyncio
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 PORT = int(os.environ.get("PORT", 8000))
 
 app = FastAPI(
     title="MovieBox API Pro",
     description="Full Pure REST API for moviebox.ph — Zero Scraping",
-    version="2.1.5"
+    version="2.1.6"
 )
 
+# CORS is browser-enforced only; server-to-server callers (moviebox server.js)
+# are unaffected. Keep the list to origins that actually embed this API.
+ALLOWED_ORIGINS = [
+    "https://hdmoviebox.fly.dev",
+    "http://localhost:7860",
+    "http://127.0.0.1:7860",
+    "http://localhost:3000",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+# Optional shared-secret guard: set API_KEY on Vercel and the same value as
+# MOVIEBOX_API_KEY on the moviebox server to lock this API down. Unset = open
+# (backward compatible).
+API_KEY = os.environ.get("API_KEY", "")
+
+@app.middleware("http")
+async def api_key_guard(request: Request, call_next):
+    if API_KEY:
+        provided = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+        if provided != API_KEY:
+            return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
+    return await call_next(request)
 
 BASE_URL = "https://moviebox.ph"
 API_BASE = "https://h5-api.aoneroom.com/wefeed-h5api-bff"
